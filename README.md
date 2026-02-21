@@ -1,4 +1,4 @@
-![dotZ80](./assets/dotz80.png)
+![dotZ80](./dotz80.png)
 
 # DotZ80 — Z80 Assembler for CP/M
 
