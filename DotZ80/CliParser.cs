@@ -86,6 +86,13 @@ public sealed record CliOptions
 
     /// <summary>All input files to be assembled in batch mode (includes the primary <see cref="InputFile"/> as the first element).</summary>
     public IReadOnlyList<string> BatchFiles { get; init; } = [];
+
+    /// <summary>
+    /// Additional directories to search when resolving <c>INCLUDE</c> directives,
+    /// supplied via one or more <c>-I &lt;dir&gt;</c> options.
+    /// The directory of the source file is always searched first regardless of this list.
+    /// </summary>
+    public IReadOnlyList<string> IncludePaths { get; init; } = [];
 }
 
 /// <summary>Parses command-line arguments into a <see cref="CliOptions"/> record.</summary>
@@ -117,8 +124,9 @@ public static class CliParser
         bool         showHelp    = false;
         bool         showVersion = false;
         OutputFormat format      = OutputFormat.Hex;
-        ushort?      orgOverride = null;
-        var          batchFiles  = new List<string>();
+        ushort?      orgOverride  = null;
+        var          batchFiles   = new List<string>();
+        var          includePaths = new List<string>();
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -162,6 +170,11 @@ public static class CliParser
                     symbols = true;
                     break;
 
+                case "-i":
+                    if (++i >= args.Length) return (new(), $"Missing value for {arg}");
+                    includePaths.Add(args[i]);
+                    break;
+
                 case "--org":
                     if (++i >= args.Length) return (new(), $"Missing value for {arg}");
                     try
@@ -198,21 +211,22 @@ public static class CliParser
 
         return (new CliOptions
         {
-            InputFile   = inputFile,
-            OutputFile  = outputFile,
-            ListingFile = listingFile,
-            SymbolFile  = symbolFile,
-            Verbose     = verbose,
-            Listing     = listing,
-            Symbols     = symbols,
-            NoColor     = noColor,
-            StdOut      = stdOut,
-            Format      = format,
-            OrgOverride = orgOverride,
-            ShowHelp    = showHelp,
-            ShowVersion = showVersion,
-            Batch       = batch,
-            BatchFiles  = batchFiles,
+            InputFile    = inputFile,
+            OutputFile   = outputFile,
+            ListingFile  = listingFile,
+            SymbolFile   = symbolFile,
+            Verbose      = verbose,
+            Listing      = listing,
+            Symbols      = symbols,
+            NoColor      = noColor,
+            StdOut       = stdOut,
+            Format       = format,
+            OrgOverride  = orgOverride,
+            ShowHelp     = showHelp,
+            ShowVersion  = showVersion,
+            Batch        = batch,
+            BatchFiles   = batchFiles,
+            IncludePaths = includePaths,
         }, null);
     }
 
@@ -255,6 +269,7 @@ public static class CliParser
           -s, --symbols         Print symbol table to console
               --sym-file <f>    Write symbol table to file (implies -s)
               --org <addr>      Override load address (e.g. 0100h or 0x0100)
+          -I <dir>              Add directory to INCLUDE search path (repeatable)
               --stdout          Print output to stdout instead of saving a file
               --no-color        Disable ANSI colour output
               --verbose         Extra diagnostic output
@@ -275,7 +290,8 @@ public static class CliParser
           Decimal: 255    Hex: 0FFh  0xFF  $FF    Binary: 10110b
 
         DIRECTIVES
-          ORG, EQU, DB/DEFB/DEFM, DW/DEFW, DS/DEFS, END
+          ORG, EQU/DEFC, DB/DEFB/DEFM, DW/DEFW, DS/DEFS, END
+          INCLUDE "file.inc"   (inserts another source file at this point)
 
         OUTPUT
           hex    — Intel HEX format, compatible with CP/M loaders,

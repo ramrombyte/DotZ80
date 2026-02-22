@@ -29,6 +29,9 @@ public sealed class AssemblerRunner(ConsoleWriter con, CliOptions opts)
     /// <summary>The underlying two-pass assembler engine used to translate source text to machine code.</summary>
     private readonly Z80AssemblerEngine _engine = new();
 
+    /// <summary>The source preprocessor that expands INCLUDE directives before assembly.</summary>
+    private readonly Preprocessor _preprocessor = new(opts.IncludePaths);
+
     /// <summary>Assemble a single file. Returns exit code (0 = success).</summary>
     /// <param name="inputFile">Path to the Z80 assembly source file to assemble.</param>
     /// <param name="outputFile">
@@ -58,6 +61,20 @@ public sealed class AssemblerRunner(ConsoleWriter con, CliOptions opts)
 
         if (opts.Verbose)
             con.Dim($"  Reading: {inputFile}  ({source.Length:N0} chars)");
+
+        // ── Preprocess INCLUDE directives ────────────────────────────────────
+        source = _preprocessor.Process(source, inputFile);
+
+        if (_preprocessor.Errors.Count > 0)
+        {
+            foreach (var err in _preprocessor.Errors)
+                con.Error($"  [ERROR] {err}");
+            con.Error($"  FAILED — {_preprocessor.Errors.Count} include error(s) in '{inputName}'");
+            return 1;
+        }
+
+        if (opts.Verbose && opts.IncludePaths.Count > 0)
+            con.Dim($"  Include paths: {string.Join(", ", opts.IncludePaths)}");
 
         // ── Inject ORG override ──────────────────────────────────────────────
         if (opts.OrgOverride.HasValue)

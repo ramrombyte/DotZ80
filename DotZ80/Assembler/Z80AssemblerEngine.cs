@@ -192,12 +192,13 @@ namespace DotZ80.Assembler
         {
             ushort pc = 0x0100;
             int i = 0;
+            bool atLineStart = true; // true after a NewLine (or at start of file)
 
             while (i < tokens.Count && tokens[i].Type != TokenType.EOF)
             {
                 var tok = tokens[i];
 
-                if (tok.Type == TokenType.NewLine) { i++; continue; }
+                if (tok.Type == TokenType.NewLine) { i++; atLineStart = true; continue; }
 
                 // Label detection: IDENT followed by COLON
                 if (tok.Type == TokenType.Identifier && i + 1 < tokens.Count && tokens[i + 1].Type == TokenType.Colon)
@@ -207,16 +208,33 @@ namespace DotZ80.Assembler
                     else
                         _symbols[tok.Value] = pc;
                     i += 2; // skip label and colon
+                    atLineStart = false;
                     continue;
                 }
 
-                // EQU without colon: IDENT EQU expr  (e.g. "DELAY EQU 100")
+                // EQU / SET without colon: IDENT EQU expr  or  IDENT SET expr
                 if (tok.Type == TokenType.Identifier && i + 1 < tokens.Count &&
                     tokens[i + 1].Type == TokenType.Mnemonic &&
-                    tokens[i + 1].Value.Equals("EQU", StringComparison.OrdinalIgnoreCase))
+                    (tokens[i + 1].Value.Equals("EQU", StringComparison.OrdinalIgnoreCase) ||
+                     tokens[i + 1].Value.Equals("SET", StringComparison.OrdinalIgnoreCase)))
                 {
                     // Symbol value resolved in Pass 2; just skip line here
                     while (i < tokens.Count && tokens[i].Type != TokenType.NewLine) i++;
+                    atLineStart = false;
+                    continue;
+                }
+
+                // 8080-style colonless label: identifier at start of line followed by mnemonic or NewLine
+                // (8080 convention: label at column 0 without a trailing colon)
+                if (atLineStart && tok.Type == TokenType.Identifier && i + 1 < tokens.Count &&
+                    (tokens[i + 1].Type == TokenType.NewLine ||
+                     tokens[i + 1].Type == TokenType.Mnemonic ||
+                     tokens[i + 1].Type == TokenType.EOF))
+                {
+                    if (!_symbols.ContainsKey(tok.Value))
+                        _symbols[tok.Value] = pc;
+                    i++; // skip just the label, keep the mnemonic for encoding
+                    atLineStart = false;
                     continue;
                 }
 
@@ -236,9 +254,39 @@ namespace DotZ80.Assembler
                             continue;
                         }
                     }
-                    else if (mn == "EQU")
+                    else if (mn == "EQU" || mn == "SET")
                     {
                         // handled in pass2 context; skip line
+                        while (i < tokens.Count && tokens[i].Type != TokenType.NewLine) i++;
+                        continue;
+                    }
+                    else if (mn == "DEFC")
+                    {
+                        // DEFC SYMBOL = expr  — Zilog/Z88DK define-constant syntax
+                        i++; // skip DEFC
+                        if (i < tokens.Count && tokens[i].Type == TokenType.Identifier)
+                        {
+                            string symName = tokens[i].Value;
+                            i++; // skip symbol name
+                            if (i < tokens.Count && tokens[i].Type == TokenType.Equals) i++; // skip '='
+                            long val = EvaluateExpr(tokens, ref i, pc, 0);
+                            _symbols[symName] = (ushort)val;
+                        }
+                        while (i < tokens.Count && tokens[i].Type != TokenType.NewLine) i++;
+                        continue;
+                    }
+                    else if (mn == "PUBLIC" || mn == "EXTERN" || mn == "GLOBAL"
+                          || mn == "MODULE" || mn == "SECTION")
+                    {
+                        // Linkage/section directives — silently ignore in Pass 1
+                        while (i < tokens.Count && tokens[i].Type != TokenType.NewLine) i++;
+                        continue;
+                    }
+                    else if (mn == "IF" || mn == "ELSE" || mn == "ENDIF" ||
+                             mn == "TITLE" || mn == "PAGE" || mn == "EJECT" ||
+                             mn == "NAME" || mn == "MACLIB")
+                    {
+                        // Unsupported meta-directives — skip silently in Pass 1
                         while (i < tokens.Count && tokens[i].Type != TokenType.NewLine) i++;
                         continue;
                     }
@@ -262,6 +310,7 @@ namespace DotZ80.Assembler
                     while (i < tokens.Count && tokens[i].Type != TokenType.NewLine) i++;
                 }
 
+                atLineStart = false;
                 i++;
             }
         }
@@ -349,7 +398,43 @@ namespace DotZ80.Assembler
 
                 case "DB": case "DEFB": case "DEFM": return CountDBSize(line);
                 case "DW": case "DEFW": return CountDWSize(line);
-                case "DS": case "DEFS": return line.Count > 1 ? (int)ParseNum(line[1].Value) : 0;
+                case "DS": case "DEFS":
+                {
+                    if (line.Count <= 1) return 0;
+                    int idx = 1;
+                    try { return (int)EvaluateExpr(line, ref idx, pc, 0); }
+                    catch { return 1; }
+                }
+
+                // ── Intel 8080 size estimates ─────────────────────────────────────
+                case "MOV": case "ANA": case "ORA": case "XRA": case "CMP":
+                case "SBB":
+                case "INR": case "DCR":
+                case "RAL": case "RAR":
+                case "XCHG": case "XTHL": case "SPHL": case "PCHL":
+                case "CMA": case "STC": case "CMC": case "HLT":
+                case "RNZ": case "RZ": case "RNC": case "RC":
+                case "RPO": case "RPE": case "RP": case "RM":
+                    return 1;
+
+                case "MVI": case "ADI": case "ACI": case "SUI": case "SBI":
+                case "ANI": case "ORI": case "XRI":
+                case "INX": case "DCX": case "DAD":
+                case "LDAX": case "STAX":
+                    return 2;
+
+                case "LXI": case "LDA": case "STA": case "LHLD": case "SHLD":
+                case "JMP": case "JNZ": case "JZ": case "JNC": case "JC":
+                case "JPO": case "JPE": case "JM":
+                case "CNZ": case "CZ": case "CNC": case "CC":
+                case "CPO": case "CPE": case "CM":
+                    return 3;
+
+                // Meta-directives — no bytes
+                case "IF": case "ELSE": case "ENDIF":
+                case "TITLE": case "PAGE": case "EJECT":
+                case "NAME": case "MACLIB": case "STKLN":
+                    return 0;
 
                 default: return 1;
             }
@@ -416,10 +501,22 @@ namespace DotZ80.Assembler
         private int EstimateLDSize(List<Token> line)
         {
             if (HasIXIY(line)) return 3;
-            // Check for 16-bit immediate: LD rr,nn
+
+            // LD r,(HL+) — pseudo: LD r,(HL) + INC HL = 2 bytes
+            if (line.Any(t => t.Type == TokenType.Plus)) return 2;
+
             bool hasParen = line.Any(t => t.Type == TokenType.LeftParen);
-            if (!hasParen && line.Count >= 4) return 3; // LD rr,nn or LD r,n
             if (hasParen) return 3;
+
+            // LD rr,rr' — pseudo: two 8-bit LDs = 2 bytes
+            if (line.Count >= 4)
+            {
+                bool bothReg16 = (line[1].Type == TokenType.Register || line[1].Type == TokenType.Identifier) &&
+                                 (line[3].Type == TokenType.Register || line[3].Type == TokenType.Identifier) &&
+                                 IsReg16Plain(line[1].Value) && IsReg16Plain(line[3].Value);
+                if (bothReg16) return 2;
+                return 3; // LD rr,nn or LD r,n
+            }
             if (line.Count >= 3 && line[2].Type == TokenType.Number) return 2;
             return 1;
         }
@@ -469,33 +566,50 @@ namespace DotZ80.Assembler
             _pc = _loadAddress;
             int i = 0;
             string pendingLabel = null;
+            bool atLineStart = true; // true after a NewLine (or at start of file)
 
             while (i < tokens.Count && tokens[i].Type != TokenType.EOF)
             {
                 var tok = tokens[i];
 
-                if (tok.Type == TokenType.NewLine) { i++; continue; }
+                if (tok.Type == TokenType.NewLine) { i++; atLineStart = true; continue; }
 
                 if (tok.Type == TokenType.Identifier && i + 1 < tokens.Count && tokens[i + 1].Type == TokenType.Colon)
                 {
                     pendingLabel = tok.Value;
                     _symbols[tok.Value] = _pc;
                     i += 2;
+                    atLineStart = false;
                     continue;
                 }
 
-                // EQU without colon: IDENT EQU expr  (e.g. "DELAY EQU 100")
+                // EQU / SET without colon: IDENT EQU expr  or  IDENT SET expr
                 if (tok.Type == TokenType.Identifier && i + 1 < tokens.Count &&
                     tokens[i + 1].Type == TokenType.Mnemonic &&
-                    tokens[i + 1].Value.Equals("EQU", StringComparison.OrdinalIgnoreCase))
+                    (tokens[i + 1].Value.Equals("EQU", StringComparison.OrdinalIgnoreCase) ||
+                     tokens[i + 1].Value.Equals("SET", StringComparison.OrdinalIgnoreCase)))
                 {
                     string symName = tok.Value;
-                    i += 2; // skip name and EQU
+                    i += 2; // skip name and EQU/SET
                     int exprIdx = i;
                     long val = EvaluateExpr(tokens, ref exprIdx, _pc, tok.Line);
                     _symbols[symName] = (ushort)val;
                     i = exprIdx;
                     while (i < tokens.Count && tokens[i].Type != TokenType.NewLine) i++;
+                    atLineStart = false;
+                    continue;
+                }
+
+                // 8080-style colonless label: identifier at start of line followed by mnemonic or NewLine
+                if (atLineStart && tok.Type == TokenType.Identifier && i + 1 < tokens.Count &&
+                    (tokens[i + 1].Type == TokenType.NewLine ||
+                     tokens[i + 1].Type == TokenType.Mnemonic ||
+                     tokens[i + 1].Type == TokenType.EOF))
+                {
+                    pendingLabel = tok.Value;
+                    _symbols[tok.Value] = _pc;
+                    i++; // skip just the label, keep the mnemonic for encoding
+                    atLineStart = false;
                     continue;
                 }
 
@@ -508,6 +622,7 @@ namespace DotZ80.Assembler
                     _listing.Add(listingLine);
                     foreach (var b in bytes) { _output.Add(b); _pc++; }
                     pendingLabel = null;
+                    atLineStart = false;
                     continue;
                 }
                 else if (tok.Type == TokenType.Identifier)
@@ -517,6 +632,7 @@ namespace DotZ80.Assembler
                     while (i < tokens.Count && tokens[i].Type != TokenType.NewLine) i++;
                 }
 
+                atLineStart = false;
                 i++;
             }
         }
@@ -634,11 +750,305 @@ namespace DotZ80.Assembler
                         return new byte[0];
 
                     case "EQU":
-                        // Should have been preceded by label - handled via symbol table
+                        // Handled via symbol table in Pass 1 / Pass 2 EQU block
+                        return new byte[0];
+
+                    case "DEFC":
+                    {
+                        // DEFC SYMBOL = expr — resolve in Pass 2 as well to keep symbol table current
+                        int idx2 = 1;
+                        if (idx2 < line.Count && line[idx2].Type == TokenType.Identifier)
+                        {
+                            string symName = line[idx2].Value;
+                            idx2++;
+                            if (idx2 < line.Count && line[idx2].Type == TokenType.Equals) idx2++;
+                            long val = EvaluateExpr(line, ref idx2, _pc, lineNum);
+                            _symbols[symName] = (ushort)val;
+                        }
+                        return new byte[0];
+                    }
+
+                    case "PUBLIC": case "EXTERN": case "GLOBAL":
+                    case "MODULE": case "SECTION":
+                        // Linkage/section directives — no code emitted
                         return new byte[0];
 
                     case "END":
                         return new byte[0];
+
+                    // Meta-directives — silently ignore
+                    case "IF": case "ELSE": case "ENDIF":
+                    case "TITLE": case "PAGE": case "EJECT":
+                    case "NAME": case "MACLIB": case "STKLN":
+                        return new byte[0];
+
+                    // ── Intel 8080 compatibility ────────────────────────────────────────
+                    // The Z80 is binary-compatible with the 8080; all 8080 opcodes are
+                    // valid Z80 opcodes.  We translate 8080 mnemonics to their Z80 bytes.
+
+                    // MOV dst,src  →  LD dst,src  (0x40 + dst*8 + src, M=6)
+                    case "MOV":
+                    {
+                        if (line.Count < 4) { _errors.Add(new AssemblerError(lineNum, "MOV requires two operands")); return new byte[0]; }
+                        int dst = Reg8Code(line[1].Value);
+                        int src = Reg8Code(line[3].Value);
+                        if (dst == 6 && src == 6) { _errors.Add(new AssemblerError(lineNum, "MOV M,M is invalid")); return new byte[0]; }
+                        return new byte[] { (byte)(0x40 | (dst << 3) | src) };
+                    }
+
+                    // MVI dst,n  →  LD dst,n  (0x06 + dst*8, n)
+                    case "MVI":
+                    {
+                        if (line.Count < 4) { _errors.Add(new AssemblerError(lineNum, "MVI requires two operands")); return new byte[0]; }
+                        int dst = Reg8Code(line[1].Value);
+                        int exI = 3; byte n = (byte)EvaluateExpr(line, ref exI, _pc, lineNum);
+                        return new byte[] { (byte)(0x06 | (dst << 3)), n };
+                    }
+
+                    // LXI rp,nn  →  LD rp,nn  (0x01 + rp*16, lo, hi)
+                    case "LXI":
+                    {
+                        if (line.Count < 4) { _errors.Add(new AssemblerError(lineNum, "LXI requires two operands")); return new byte[0]; }
+                        int rp = Reg16Code8080(line[1].Value);
+                        int exI = 3; ushort nn = (ushort)EvaluateExpr(line, ref exI, _pc, lineNum);
+                        return new byte[] { (byte)(0x01 | (rp << 4)), (byte)(nn & 0xFF), (byte)(nn >> 8) };
+                    }
+
+                    // LDA nn  →  LD A,(nn)  (0x3A, lo, hi)
+                    case "LDA":
+                    {
+                        int exI = 1; ushort nn = (ushort)EvaluateExpr(line, ref exI, _pc, lineNum);
+                        return new byte[] { 0x3A, (byte)(nn & 0xFF), (byte)(nn >> 8) };
+                    }
+
+                    // STA nn  →  LD (nn),A  (0x32, lo, hi)
+                    case "STA":
+                    {
+                        int exI = 1; ushort nn = (ushort)EvaluateExpr(line, ref exI, _pc, lineNum);
+                        return new byte[] { 0x32, (byte)(nn & 0xFF), (byte)(nn >> 8) };
+                    }
+
+                    // LHLD nn  →  LD HL,(nn)  (0x2A, lo, hi)
+                    case "LHLD":
+                    {
+                        int exI = 1; ushort nn = (ushort)EvaluateExpr(line, ref exI, _pc, lineNum);
+                        return new byte[] { 0x2A, (byte)(nn & 0xFF), (byte)(nn >> 8) };
+                    }
+
+                    // SHLD nn  →  LD (nn),HL  (0x22, lo, hi)
+                    case "SHLD":
+                    {
+                        int exI = 1; ushort nn = (ushort)EvaluateExpr(line, ref exI, _pc, lineNum);
+                        return new byte[] { 0x22, (byte)(nn & 0xFF), (byte)(nn >> 8) };
+                    }
+
+                    // LDAX rp  →  LD A,(rp)  BC=0x0A  DE=0x1A
+                    case "LDAX":
+                    {
+                        string rp = line.Count > 1 ? line[1].Value.ToUpper() : "";
+                        if (rp == "B" || rp == "BC") return new byte[] { 0x0A };
+                        if (rp == "D" || rp == "DE") return new byte[] { 0x1A };
+                        _errors.Add(new AssemblerError(lineNum, $"LDAX: invalid register pair '{rp}'")); return new byte[0];
+                    }
+
+                    // STAX rp  →  LD (rp),A  BC=0x02  DE=0x12
+                    case "STAX":
+                    {
+                        string rp = line.Count > 1 ? line[1].Value.ToUpper() : "";
+                        if (rp == "B" || rp == "BC") return new byte[] { 0x02 };
+                        if (rp == "D" || rp == "DE") return new byte[] { 0x12 };
+                        _errors.Add(new AssemblerError(lineNum, $"STAX: invalid register pair '{rp}'")); return new byte[0];
+                    }
+
+                    // XCHG  →  EX DE,HL  (0xEB)
+                    case "XCHG": return new byte[] { 0xEB };
+
+                    // XTHL  →  EX (SP),HL  (0xE3)
+                    case "XTHL": return new byte[] { 0xE3 };
+
+                    // SPHL  →  LD SP,HL  (0xF9)
+                    case "SPHL": return new byte[] { 0xF9 };
+
+                    // PCHL  →  JP (HL)  (0xE9)
+                    case "PCHL": return new byte[] { 0xE9 };
+
+                    // ADI n  →  ADD A,n  (0xC6, n)
+                    case "ADI":
+                    {
+                        int exI = 1; byte n = (byte)EvaluateExpr(line, ref exI, _pc, lineNum);
+                        return new byte[] { 0xC6, n };
+                    }
+
+                    // ACI n  →  ADC A,n  (0xCE, n)
+                    case "ACI":
+                    {
+                        int exI = 1; byte n = (byte)EvaluateExpr(line, ref exI, _pc, lineNum);
+                        return new byte[] { 0xCE, n };
+                    }
+
+                    // SUI n  →  SUB n  (0xD6, n)
+                    case "SUI":
+                    {
+                        int exI = 1; byte n = (byte)EvaluateExpr(line, ref exI, _pc, lineNum);
+                        return new byte[] { 0xD6, n };
+                    }
+
+                    // SBB r/M  →  SBC A,r  (0x98 + src)
+                    case "SBB":
+                    {
+                        if (line.Count < 2) { _errors.Add(new AssemblerError(lineNum, "SBB requires operand")); return new byte[0]; }
+                        int src = Reg8Code(line[1].Value);
+                        return new byte[] { (byte)(0x98 | src) };
+                    }
+
+                    // SBI n  →  SBC A,n  (0xDE, n)
+                    case "SBI":
+                    {
+                        int exI = 1; byte n = (byte)EvaluateExpr(line, ref exI, _pc, lineNum);
+                        return new byte[] { 0xDE, n };
+                    }
+
+                    // ANA r/M  →  AND r  (0xA0 + src)
+                    case "ANA":
+                    {
+                        if (line.Count < 2) { _errors.Add(new AssemblerError(lineNum, "ANA requires operand")); return new byte[0]; }
+                        int src = Reg8Code(line[1].Value);
+                        return new byte[] { (byte)(0xA0 | src) };
+                    }
+
+                    // ANI n  →  AND n  (0xE6, n)
+                    case "ANI":
+                    {
+                        int exI = 1; byte n = (byte)EvaluateExpr(line, ref exI, _pc, lineNum);
+                        return new byte[] { 0xE6, n };
+                    }
+
+                    // ORA r/M  →  OR r  (0xB0 + src)
+                    case "ORA":
+                    {
+                        if (line.Count < 2) { _errors.Add(new AssemblerError(lineNum, "ORA requires operand")); return new byte[0]; }
+                        int src = Reg8Code(line[1].Value);
+                        return new byte[] { (byte)(0xB0 | src) };
+                    }
+
+                    // ORI n  →  OR n  (0xF6, n)
+                    case "ORI":
+                    {
+                        int exI = 1; byte n = (byte)EvaluateExpr(line, ref exI, _pc, lineNum);
+                        return new byte[] { 0xF6, n };
+                    }
+
+                    // XRA r/M  →  XOR r  (0xA8 + src)
+                    case "XRA":
+                    {
+                        if (line.Count < 2) { _errors.Add(new AssemblerError(lineNum, "XRA requires operand")); return new byte[0]; }
+                        int src = Reg8Code(line[1].Value);
+                        return new byte[] { (byte)(0xA8 | src) };
+                    }
+
+                    // XRI n  →  XOR n  (0xEE, n)
+                    case "XRI":
+                    {
+                        int exI = 1; byte n = (byte)EvaluateExpr(line, ref exI, _pc, lineNum);
+                        return new byte[] { 0xEE, n };
+                    }
+
+                    // CMP r/M  →  CP r  (0xB8 + src)
+                    case "CMP":
+                    {
+                        if (line.Count < 2) { _errors.Add(new AssemblerError(lineNum, "CMP requires operand")); return new byte[0]; }
+                        int src = Reg8Code(line[1].Value);
+                        return new byte[] { (byte)(0xB8 | src) };
+                    }
+
+                    // CMA  →  CPL  (0x2F)
+                    case "CMA": return new byte[] { 0x2F };
+
+                    // STC  →  SCF  (0x37)
+                    case "STC": return new byte[] { 0x37 };
+
+                    // CMC  →  CCF  (0x3F)
+                    case "CMC": return new byte[] { 0x3F };
+
+                    // HLT  →  HALT  (0x76)
+                    case "HLT": return new byte[] { 0x76 };
+
+                    // INR r/M  →  INC r  (0x04 + r*8)
+                    case "INR":
+                    {
+                        if (line.Count < 2) { _errors.Add(new AssemblerError(lineNum, "INR requires operand")); return new byte[0]; }
+                        int r = Reg8Code(line[1].Value);
+                        return new byte[] { (byte)(0x04 | (r << 3)) };
+                    }
+
+                    // DCR r/M  →  DEC r  (0x05 + r*8)
+                    case "DCR":
+                    {
+                        if (line.Count < 2) { _errors.Add(new AssemblerError(lineNum, "DCR requires operand")); return new byte[0]; }
+                        int r = Reg8Code(line[1].Value);
+                        return new byte[] { (byte)(0x05 | (r << 3)) };
+                    }
+
+                    // INX rp  →  INC rp  (0x03 + rp*16)
+                    case "INX":
+                    {
+                        if (line.Count < 2) { _errors.Add(new AssemblerError(lineNum, "INX requires operand")); return new byte[0]; }
+                        int rp = Reg16Code8080(line[1].Value);
+                        return new byte[] { (byte)(0x03 | (rp << 4)) };
+                    }
+
+                    // DCX rp  →  DEC rp  (0x0B + rp*16)
+                    case "DCX":
+                    {
+                        if (line.Count < 2) { _errors.Add(new AssemblerError(lineNum, "DCX requires operand")); return new byte[0]; }
+                        int rp = Reg16Code8080(line[1].Value);
+                        return new byte[] { (byte)(0x0B | (rp << 4)) };
+                    }
+
+                    // DAD rp  →  ADD HL,rp  (0x09 + rp*16)
+                    case "DAD":
+                    {
+                        if (line.Count < 2) { _errors.Add(new AssemblerError(lineNum, "DAD requires operand")); return new byte[0]; }
+                        int rp = Reg16Code8080(line[1].Value);
+                        return new byte[] { (byte)(0x09 | (rp << 4)) };
+                    }
+
+                    // RAL  →  RLA  (0x17)
+                    case "RAL": return new byte[] { 0x17 };
+
+                    // RAR  →  RRA  (0x1F)
+                    case "RAR": return new byte[] { 0x1F };
+
+                    // JMP nn  →  JP nn  (0xC3, lo, hi)
+                    case "JMP": return Encode8080Jump(line, lineNum, 0xC3);
+
+                    // Conditional jumps  (0xC2/CA/D2/DA/E2/EA/F2/FA)
+                    case "JNZ": return Encode8080Jump(line, lineNum, 0xC2);
+                    case "JZ":  return Encode8080Jump(line, lineNum, 0xCA);
+                    case "JNC": return Encode8080Jump(line, lineNum, 0xD2);
+                    case "JC":  return Encode8080Jump(line, lineNum, 0xDA);
+                    case "JPO": return Encode8080Jump(line, lineNum, 0xE2);
+                    case "JPE": return Encode8080Jump(line, lineNum, 0xEA);
+                    case "JM":  return Encode8080Jump(line, lineNum, 0xFA);
+
+                    // Conditional calls  (0xC4/CC/D4/DC/E4/EC/F4/FC)
+                    case "CNZ": return Encode8080Jump(line, lineNum, 0xC4);
+                    case "CZ":  return Encode8080Jump(line, lineNum, 0xCC);
+                    case "CNC": return Encode8080Jump(line, lineNum, 0xD4);
+                    case "CC":  return Encode8080Jump(line, lineNum, 0xDC);
+                    case "CPO": return Encode8080Jump(line, lineNum, 0xE4);
+                    case "CPE": return Encode8080Jump(line, lineNum, 0xEC);
+                    case "CM":  return Encode8080Jump(line, lineNum, 0xFC);
+
+                    // Conditional returns  (0xC0/C8/D0/D8/E0/E8/F0/F8)
+                    case "RNZ": return new byte[] { 0xC0 };
+                    case "RZ":  return new byte[] { 0xC8 };
+                    case "RNC": return new byte[] { 0xD0 };
+                    case "RC":  return new byte[] { 0xD8 };
+                    case "RPO": return new byte[] { 0xE0 };
+                    case "RPE": return new byte[] { 0xE8 };
+                    case "RP":  return new byte[] { 0xF0 };
+                    case "RM":  return new byte[] { 0xF8 };
 
                     default:
                         // Silently ignore dot-prefixed processor directives (.Z80, .Z180, .8080, etc.)
@@ -692,6 +1102,29 @@ namespace DotZ80.Assembler
 
             string dstReg = dstInd ? StripParens(dst) : GetReg(dst);
             string srcReg = srcInd ? StripParens(src) : GetReg(src);
+
+            // LD rr, rr'  — Zilog assembler pseudo-op: expands to two 8-bit LD instructions.
+            // e.g. LD HL,BC → LD H,B ; LD L,C
+            if (!dstInd && !srcInd && IsReg16Plain(dstReg) && IsReg16Plain(srcReg))
+            {
+                var (dstHi, dstLo) = SplitReg16(dstReg);
+                var (srcHi, srcLo) = SplitReg16(srcReg);
+                return new byte[]
+                {
+                    (byte)(0x40 | (Reg8Code(dstHi) << 3) | Reg8Code(srcHi)),
+                    (byte)(0x40 | (Reg8Code(dstLo) << 3) | Reg8Code(srcLo))
+                };
+            }
+
+            // LD r,(HL+)  — Zilog assembler shorthand: LD r,(HL) then INC HL (2 bytes)
+            if (!dstInd && IsReg8(dstReg) && src.Trim().ToUpper() == "(HL+)")
+            {
+                return new byte[]
+                {
+                    (byte)(0x46 | (Reg8Code(dstReg) << 3)),  // LD r,(HL)
+                    0x23                                       // INC HL
+                };
+            }
 
             // LD r, r'
             if (!dstInd && !srcInd && IsReg8(dstReg) && IsReg8(srcReg))
@@ -861,6 +1294,15 @@ namespace DotZ80.Assembler
             string dstR = GetReg(dst);
             string srcR = GetReg(src);
 
+            // 8080 single-operand form: ADD r  (implicit accumulator destination)
+            if (src == "")
+            {
+                if (IsReg8(dstR)) return new byte[] { (byte)(0x80 | Reg8Code(dstR)) };
+                if (dstR == "(HL)" || dstR == "M") return new byte[] { 0x86 };
+                int n = EvalOperand(dst, lineNum);
+                return new byte[] { 0xC6, (byte)n };
+            }
+
             if (dstR == "A")
             {
                 if (IsReg8(srcR)) return new byte[] { (byte)(0x80 | Reg8Code(srcR)) };
@@ -894,6 +1336,16 @@ namespace DotZ80.Assembler
             var (dst, src) = SplitOperands(line);
             string dstR = GetReg(dst);
             string srcR = GetReg(src);
+
+            // 8080 single-operand form: ADC r  (implicit accumulator destination)
+            if (src == "")
+            {
+                if (IsReg8(dstR)) return new byte[] { (byte)(0x88 | Reg8Code(dstR)) };
+                if (dstR == "(HL)" || dstR == "M") return new byte[] { 0x8E };
+                int n = EvalOperand(dst, lineNum);
+                return new byte[] { 0xCE, (byte)n };
+            }
+
             if (dstR == "A")
             {
                 if (IsReg8(srcR)) return new byte[] { (byte)(0x88 | Reg8Code(srcR)) };
@@ -1393,6 +1845,35 @@ namespace DotZ80.Assembler
         }
 
         /// <summary>
+        /// Returns <see langword="true"/> if <paramref name="r"/> is a plain splittable 16-bit pair
+        /// (BC, DE, HL, or AF) — valid as src/dst in the <c>LD rr,rr</c> Zilog pseudo-op.
+        /// </summary>
+        private bool IsReg16Plain(string r)
+        {
+            switch (r.ToUpper())
+            {
+                case "BC": case "DE": case "HL": case "AF": return true;
+                default: return false;
+            }
+        }
+
+        /// <summary>
+        /// Splits a plain 16-bit register pair into its high and low 8-bit halves,
+        /// used to expand the <c>LD rr,rr</c> pseudo-op into two 8-bit LD instructions.
+        /// </summary>
+        private (string hi, string lo) SplitReg16(string r)
+        {
+            switch (r.ToUpper())
+            {
+                case "BC": return ("B", "C");
+                case "DE": return ("D", "E");
+                case "HL": return ("H", "L");
+                case "AF": return ("A", "F");
+                default:   return ("H", "L");
+            }
+        }
+
+        /// <summary>
         /// Returns the 3-bit register field code for an 8-bit register as used in Z80 opcodes.
         /// B=0, C=1, D=2, E=3, H=4, L=5, (HL)=6, A=7.
         /// </summary>
@@ -1591,12 +2072,49 @@ namespace DotZ80.Assembler
 
         /// <summary>
         /// Parses a numeric literal string to a <see cref="long"/> value.
+        // ── Intel 8080 helper methods ────────────────────────────────────────────
+
+        /// <summary>
+        /// Returns the 2-bit register-pair code for an 8080 register pair operand.
+        /// 8080 uses single-letter abbreviations: B=BC(0), D=DE(1), H=HL(2), SP/PSW=3.
+        /// </summary>
+        private int Reg16Code8080(string r)
+        {
+            switch (r.Trim().ToUpper())
+            {
+                case "B": case "BC":  return 0;
+                case "D": case "DE":  return 1;
+                case "H": case "HL":  return 2;
+                case "SP": case "PSW": return 3;
+                default: return 0;
+            }
+        }
+
+        /// <summary>
+        /// Encodes an 8080 unconditional or conditional jump/call instruction with a 16-bit address.
+        /// </summary>
+        private byte[] Encode8080Jump(List<Token> line, int lineNum, byte opcode)
+        {
+            if (line.Count < 2) { _errors.Add(new AssemblerError(lineNum, $"{line[0].Value} requires address operand")); return new byte[0]; }
+            int exI = 1;
+            ushort nn = (ushort)EvaluateExpr(line, ref exI, _pc, lineNum);
+            // Patch support: if the target is a forward label, record a patch
+            if (line.Count > 1 && line[1].Type == TokenType.Identifier && !_symbols.ContainsKey(line[1].Value))
+            {
+                _patches.Add((_output.Count + 1, line[1].Value, lineNum, false));
+                nn = 0;
+            }
+            return new byte[] { opcode, (byte)(nn & 0xFF), (byte)(nn >> 8) };
+        }
+
+        // ── Numeric literal parser ────────────────────────────────────────────────
+
         /// Supported formats: decimal (<c>255</c>), hex (<c>0xFF</c>, <c>$FF</c>, <c>0FFh</c>),
         /// and binary (<c>11001010b</c>).
         /// </summary>
         /// <param name="s">The numeric literal string to parse.</param>
         /// <returns>The parsed value.</returns>
-        /// <exception cref="FormatException">Thrown when <paramref name="s"/> cannot be parsed.</exception>
+        /// <remarks>Returns 0 for any input that cannot be parsed as a numeric literal.</remarks>
         private long ParseNum(string s)
         {
             s = s.Trim().Replace(" ", "");
@@ -1609,7 +2127,7 @@ namespace DotZ80.Assembler
             if (s.EndsWith("b") || s.EndsWith("B") && s.Length > 1)
                 try { return Convert.ToInt64(s.Substring(0, s.Length - 1), 2); } catch { }
             if (long.TryParse(s, out long v)) return v;
-            throw new FormatException($"Cannot parse number: {s}");
+            return 0; // non-numeric token (symbol name etc.) — caller handles resolution
         }
 
         /// <summary>

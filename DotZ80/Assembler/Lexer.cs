@@ -75,6 +75,9 @@ namespace DotZ80.Assembler
         /// <summary>The sentinel token appended at the end of the token stream.</summary>
         EOF,
 
+        /// <summary>An equals sign (<c>=</c>), used in <c>DEFC</c> constant definitions.</summary>
+        Equals,
+
         /// <summary>Any character that does not match any other token category.</summary>
         Unknown,
     }
@@ -123,6 +126,7 @@ namespace DotZ80.Assembler
         /// </summary>
         private static readonly HashSet<string> Mnemonics = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
+            // ── Z80 instructions ────────────────────────────────────────────────────
             "LD","LDD","LDI","LDDR","LDIR","PUSH","POP",
             "ADD","ADC","SUB","SBC","AND","OR","XOR","CP","INC","DEC","NEG","CPL","DAA","RLCA","RRCA","RLA","RRA",
             "RL","RR","RLC","RRC","SLA","SRA","SRL","SLL",
@@ -130,7 +134,23 @@ namespace DotZ80.Assembler
             "JP","JR","CALL","RET","RETI","RETN","DJNZ","RST",
             "IN","OUT","INI","IND","INIR","INDR","OUTI","OUTD","OTIR","OTDR",
             "EX","EXX","DI","EI","HALT","NOP","SCF","CCF","IM",
-            "DB","DW","DS","ORG","EQU","DEFB","DEFW","DEFS","DEFM","END"
+            // ── Assembler directives ────────────────────────────────────────────────
+            "DB","DW","DS","ORG","EQU","DEFB","DEFW","DEFS","DEFM","END","INCLUDE",
+            "DEFC","PUBLIC","EXTERN","GLOBAL","MODULE","SECTION",
+            // ── Intel 8080 mnemonics (tokenised but not encoded — emits error) ─────
+            "MOV","MVI","LXI","LDA","STA","LHLD","SHLD","LDAX","STAX",
+            "ADD","ADI","ACI","SUB","SBI","SUI","SBB","ANA","ORA","XRA","CMP",
+            "ANI","ORI","XRI","CPI","ADC",
+            "INR","DCR","INX","DCX","DAD",
+            "RLC","RRC","RAL","RAR",
+            "JMP","JC","JNC","JZ","JNZ","JP","JM","JPE","JPO",
+            "CALL","CC","CNC","CZ","CNZ","CP","CM","CPE","CPO",
+            "RET","RC","RNC","RZ","RNZ","RP","RM","RPE","RPO",
+            "RST","PCHL","SPHL","XTHL","XCHG",
+            "PUSH","POP",
+            "IN","OUT","EI","DI","HLT","NOP","STC","CMC","CMA","DAA",
+            "TITLE","PAGE","EJECT","NAME","STKLN","MACLIB",
+            "IF","ELSE","ENDIF","SET",
         };
 
         /// <summary>
@@ -221,12 +241,23 @@ namespace DotZ80.Assembler
                         }
                         else
                         {
-                            while (i < line.Length && (char.IsDigit(line[i]) || IsHexChar(line[i]))) i++;
+                            // Allow $ as a visual digit-group separator (8080 style: 1111$1110B)
+                            while (i < line.Length && (char.IsDigit(line[i]) || IsHexChar(line[i]) || line[i] == '$')) i++;
+                            // Check for B suffix (binary)
+                            if (i < line.Length && (line[i] == 'b' || line[i] == 'B') &&
+                                !char.IsLetterOrDigit(i + 1 < line.Length ? line[i + 1] : ' '))
+                            {
+                                // Strip embedded $ separators, then parse as binary
+                                string binVal = line.Substring(start, i - start).Replace("$", "");
+                                tokens.Add(new Token(TokenType.Number, binVal + "b", lineNum + 1));
+                                i++;
+                                continue;
+                            }
                             // Check for H suffix (hex)
                             if (i < line.Length && (line[i] == 'h' || line[i] == 'H') &&
                                 !char.IsLetterOrDigit(i + 1 < line.Length ? line[i + 1] : ' '))
                             {
-                                string hexVal = line.Substring(start, i - start);
+                                string hexVal = line.Substring(start, i - start).Replace("$", "");
                                 tokens.Add(new Token(TokenType.Number, "0x" + hexVal, lineNum + 1));
                                 i++;
                                 continue;
@@ -251,15 +282,18 @@ namespace DotZ80.Assembler
                     if (char.IsLetter(c) || c == '_')
                     {
                         int start = i;
-                        while (i < line.Length && (char.IsLetterOrDigit(line[i]) || line[i] == '_' || line[i] == '\'')) i++;
+                        while (i < line.Length && (char.IsLetterOrDigit(line[i]) || line[i] == '_' || line[i] == '\'' || line[i] == '$')) i++;
                         string word = line.Substring(start, i - start);
+                        // Strip embedded '$' separators for lookup and storage:
+                        // 8080 source uses '$' as a word-separator in identifiers (e.g. set$alloc$bit == setallocbit)
+                        string normalized = word.Replace("$", "");
 
-                        if (Registers.Contains(word))
-                            tokens.Add(new Token(TokenType.Register, word.ToUpper(), lineNum + 1));
-                        else if (Mnemonics.Contains(word))
-                            tokens.Add(new Token(TokenType.Mnemonic, word.ToUpper(), lineNum + 1));
+                        if (Registers.Contains(normalized))
+                            tokens.Add(new Token(TokenType.Register, normalized.ToUpper(), lineNum + 1));
+                        else if (Mnemonics.Contains(normalized))
+                            tokens.Add(new Token(TokenType.Mnemonic, normalized.ToUpper(), lineNum + 1));
                         else
-                            tokens.Add(new Token(TokenType.Identifier, word, lineNum + 1));
+                            tokens.Add(new Token(TokenType.Identifier, normalized, lineNum + 1));
                         continue;
                     }
 
@@ -273,6 +307,7 @@ namespace DotZ80.Assembler
                         case '-': tokens.Add(new Token(TokenType.Minus, "-", lineNum + 1)); break;
                         case '*': tokens.Add(new Token(TokenType.Multiply, "*", lineNum + 1)); break;
                         case '/': tokens.Add(new Token(TokenType.Divide, "/", lineNum + 1)); break;
+                        case '=': tokens.Add(new Token(TokenType.Equals, "=", lineNum + 1)); break;
                         default: tokens.Add(new Token(TokenType.Unknown, c.ToString(), lineNum + 1)); break;
                     }
                     i++;
